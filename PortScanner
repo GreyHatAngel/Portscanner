@@ -1,0 +1,846 @@
+#!/bin/bash
+
+# Script pentru Port Scanning stealth cu proxy rotation și banner grabbing
+# VERSIUNE SECURIZATĂ - Toate request-urile trec prin proxy
+# Usage: ./port_scanner.sh <target> [options]
+
+# Culori pentru output frumos
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+ORANGE='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configurări
+MAX_THREADS=5
+DELAY=2
+TIMEOUT=10
+PORT_RANGE="1-65535"
+SCAN_TYPE="connect"  # connect, syn, udp
+USE_PROXY=false
+MAX_RETRIES=2
+BANNER_GRAB=true
+STEALTH_MODE=true
+SHOW_RETRY_MESSAGES=false
+
+# Variabile pentru statistici și logging
+START_TIME=""
+END_TIME=""
+TOTAL_PORTS_SCANNED=0
+OPEN_PORTS=0
+CLOSED_PORTS=0
+FILTERED_PORTS=0
+ERROR_PORTS=0
+LOG_FILE=""
+REQUEST_LOG_FILE=""
+TARGET_HOST=""
+STATS_FILE=""
+
+# Common ports pentru scan rapid
+COMMON_PORTS=(20 21 22 23 25 53 69 80 110 111 123 135 137 138 139 143 161 162 389 443 445 514 587 993 995 1433 1521 1723 2049 3306 3389 5432 5900 6379 8080 8443 9200 11211 27017)
+
+# ===============================================
+# PROXY LIST - Adaugă aici proxy-urile tale
+# Format: TYPE:IP:PORT:USERNAME:PASSWORD
+# ===============================================
+PROXY_LIST=(
+    "protocol:ip:user:pass"
+)
+
+# Array cu user agents random
+USER_AGENTS=(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0"
+)
+
+# Service signatures pentru identificare
+declare -A SERVICE_SIGNATURES=(
+    ["SSH"]="SSH-"
+    ["HTTP"]="HTTP/1"
+    ["HTTPS"]="HTTP/1"
+    ["FTP"]="220"
+    ["SMTP"]="220.*SMTP"
+    ["POP3"]="\\+OK"
+    ["IMAP"]="\\* OK"
+    ["MySQL"]="mysql_native_password"
+    ["PostgreSQL"]="FATAL"
+    ["Redis"]="\\-ERR"
+    ["MongoDB"]="MongoDB"
+    ["RDP"]="Remote Desktop"
+    ["VNC"]="RFB"
+    ["Telnet"]="telnet"
+)
+
+# Check dependencies
+check_dependencies() {
+    local missing_deps=()
+    
+    command -v nc >/dev/null 2>&1 || missing_deps+=("netcat/nc")
+    command -v timeout >/dev/null 2>&1 || missing_deps+=("timeout")
+    command -v curl >/dev/null 2>&1 || missing_deps+=("curl")
+    command -v proxychains >/dev/null 2>&1 || missing_deps+=("proxychains-ng")
+    
+    if [ "$USE_PROXY" = true ]; then
+        if ! command -v proxychains >/dev/null 2>&1; then
+            echo -e "${RED}❌ CRITICAL: proxychains-ng is required for proxy support!${NC}"
+            echo -e "${YELLOW}Install it with: sudo apt install proxychains-ng${NC}"
+            exit 1
+        fi
+    fi
+    
+    if [ ${#missing_deps[@]} -ne 0 ]; then
+        echo -e "${RED}❌ Missing required dependencies: ${missing_deps[*]}${NC}"
+        echo -e "${YELLOW}Please install them before running this script.${NC}"
+        exit 1
+    fi
+}
+
+# Configurează proxychains pentru proxy-ul curent
+setup_proxychains() {
+    local proxy_info="$1"
+    if [ -z "$proxy_info" ]; then
+        return 1
+    fi
+    
+    local proxy_type=$(echo "$proxy_info" | cut -d':' -f1)
+    local proxy_ip=$(echo "$proxy_info" | cut -d':' -f2)
+    local proxy_port=$(echo "$proxy_info" | cut -d':' -f3)
+    local proxy_user=$(echo "$proxy_info" | cut -d':' -f4)
+    local proxy_pass=$(echo "$proxy_info" | cut -d':' -f5)
+    
+    # Creează fișier de configurare proxychains temporar
+    local config_file="/tmp/.proxychains_$$_${RANDOM}.conf"
+    
+    cat > "$config_file" << EOF
+# ProxyChains-NG Configuration
+strict_chain
+proxy_dns
+remote_dns_subnet 224
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+
+[ProxyList]
+EOF
+    
+    # Adaugă proxy-ul la configurație
+    if [ -n "$proxy_user" ] && [ -n "$proxy_pass" ]; then
+        echo "$proxy_type $proxy_ip $proxy_port $proxy_user $proxy_pass" >> "$config_file"
+    else
+        echo "$proxy_type $proxy_ip $proxy_port" >> "$config_file"
+    fi
+    
+    echo "$config_file"
+}
+
+# Banner frumos
+show_banner() {
+    echo -e "${PURPLE}"
+    echo "╔══════════════════════════════════════════════╗"
+    echo "║     🔒 SECURE Port Scanner v3.0 🔒           ║"
+    echo "║    With FULL Proxy Protection                ║"
+    echo "║         Threads: $MAX_THREADS | Delay: ${DELAY}s            ║"
+    echo "╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+# Verifică argumentele
+check_args() {
+    if [ $# -lt 1 ]; then
+        echo -e "${RED}Usage: $0 <target> [options]${NC}"
+        echo -e "${YELLOW}Options:${NC}"
+        echo -e "  ${BLUE}-pr <ports>${NC}       Port range (default: 1-65535)"
+        echo -e "  ${BLUE}-cp${NC}               Scan only common ports"
+        echo -e "  ${BLUE}-t <threads>${NC}      Number of threads (default: 5)"
+        echo -e "  ${BLUE}-d <delay>${NC}        Delay between threads (default: 2s)"
+        echo -e "  ${BLUE}--timeout <sec>${NC}   Connection timeout (default: 10s)"
+        echo -e "  ${BLUE}-p, --proxy${NC}       Use proxy rotation (REQUIRED for anonymity)"
+        echo -e "  ${BLUE}--no-banner${NC}       Disable banner grabbing"
+        echo -e "  ${BLUE}--fast${NC}            Fast scan (less stealth)"
+        echo ""
+        echo -e "${YELLOW}Examples:${NC}"
+        echo -e "  $0 192.168.1.1 -cp --proxy              # Scan common ports via proxy"
+        echo -e "  $0 example.com -pr 80,443,8080 -p       # Specific ports with proxy"
+        echo -e "  $0 10.0.0.1 -pr 1-1000 -t 10 --fast -p # Fast scan first 1000 ports"
+        echo ""
+        echo -e "${RED}⚠️  WARNING: Without --proxy flag, your real IP will be exposed!${NC}"
+        exit 1
+    fi
+    
+    TARGET_HOST=$1
+    shift
+    
+    # Parse argumentele opționale
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -pr|--port-range)
+                PORT_RANGE="$2"
+                shift 2
+                ;;
+            -cp|--common-ports)
+                PORT_RANGE="COMMON"
+                shift
+                ;;
+            -t|--threads)
+                MAX_THREADS="$2"
+                shift 2
+                ;;
+            -d|--delay)
+                DELAY="$2"
+                shift 2
+                ;;
+            --timeout)
+                TIMEOUT="$2"
+                shift 2
+                ;;
+            -p|--proxy)
+                USE_PROXY=true
+                shift
+                ;;
+            --no-banner)
+                BANNER_GRAB=false
+                shift
+                ;;
+            --fast)
+                STEALTH_MODE=false
+                MAX_THREADS=20
+                DELAY=0.1
+                TIMEOUT=3
+                shift
+                ;;
+            *)
+                echo -e "${RED}Unknown option: $1${NC}"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Verifică dacă proxychains este instalat când proxy e activat
+    if [ "$USE_PROXY" = true ]; then
+        if ! command -v proxychains >/dev/null 2>&1; then
+            echo -e "${RED}❌ proxychains-ng is required for proxy support!${NC}"
+            echo -e "${YELLOW}Install with: sudo apt install proxychains-ng${NC}"
+            exit 1
+        fi
+    fi
+    
+    # Rezolvă hostname la IP dacă e necesar - PRIN PROXY
+    if [[ ! "$TARGET_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo -e "${YELLOW}📡 Resolving hostname...${NC}"
+        local resolved_ip=""
+        
+        if [ "$USE_PROXY" = true ]; then
+            # Folosește un proxy random pentru DNS
+            local proxy_info="${PROXY_LIST[$RANDOM % ${#PROXY_LIST[@]}]}"
+            local config_file=$(setup_proxychains "$proxy_info")
+            
+            # Rezolvă prin proxy folosind dig sau nslookup
+            if command -v dig >/dev/null 2>&1; then
+                resolved_ip=$(proxychains -q -f "$config_file" dig +short "$TARGET_HOST" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+            elif command -v nslookup >/dev/null 2>&1; then
+                resolved_ip=$(proxychains -q -f "$config_file" nslookup "$TARGET_HOST" 2>/dev/null | grep -A 1 "Name:" | grep "Address:" | awk '{print $2}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+            fi
+            
+            rm -f "$config_file"
+        else
+            resolved_ip=$(getent hosts "$TARGET_HOST" | awk '{print $1}' | head -1)
+        fi
+        
+        if [ -n "$resolved_ip" ]; then
+            echo -e "${GREEN}✅ Resolved $TARGET_HOST to $resolved_ip${NC}"
+            TARGET_HOST="$resolved_ip"
+        else
+            echo -e "${RED}❌ Failed to resolve hostname${NC}"
+            exit 1
+        fi
+    fi
+    
+    # Creează numele fișierului de log principal
+    local start_date=$(date '+%d-%m-%Y_%H-%M')
+    LOG_FILE="port-scan-${TARGET_HOST}-${start_date}.txt"
+    # Creează numele fișierului de log pentru request-uri
+    REQUEST_LOG_FILE="logfile_${TARGET_HOST}_${start_date}.txt"
+    STATS_FILE="/tmp/.portscan_stats_$$"
+    
+    # Inițializează fișierul de statistici
+    echo "0 0 0 0 0" > "$STATS_FILE"
+    
+    echo -e "${BLUE}🎯 Target Host: $TARGET_HOST${NC}"
+    echo -e "${BLUE}🔍 Port Range: $PORT_RANGE${NC}"
+    echo -e "${BLUE}📄 Log File: $LOG_FILE${NC}"
+    echo -e "${BLUE}📜 Request Log File: $REQUEST_LOG_FILE${NC}"
+    echo -e "${BLUE}🧵 Threads: $MAX_THREADS${NC}"
+    echo -e "${BLUE}⏱️  Delay: ${DELAY}s${NC}"
+    echo -e "${BLUE}⏱️  Timeout: ${TIMEOUT}s${NC}"
+    echo -e "${BLUE}🏷️  Banner Grab: $([ "$BANNER_GRAB" = true ] && echo "ENABLED" || echo "DISABLED")${NC}"
+    echo -e "${BLUE}🥷 Stealth Mode: $([ "$STEALTH_MODE" = true ] && echo "ENABLED" || echo "DISABLED")${NC}"
+    
+    if [ "$USE_PROXY" = true ]; then
+        echo -e "${BLUE}🔄 Proxy rotation: ${GREEN}ENABLED${NC} (${#PROXY_LIST[@]} proxies)"
+        echo -e "${GREEN}🔒 ALL traffic will be routed through proxies${NC}"
+    else
+        echo -e "${BLUE}🔄 Proxy rotation: ${RED}DISABLED${NC}"
+        echo -e "${RED}⚠️  WARNING: Your real IP address will be exposed!${NC}"
+        echo -e "${YELLOW}   Press Ctrl+C to cancel and run with --proxy flag${NC}"
+        echo -e "${YELLOW}   Continuing in 5 seconds...${NC}"
+        sleep 5
+    fi
+    
+    echo ""
+}
+
+# Funcție pentru logging în fișier
+log_to_file() {
+    local message="$1"
+    echo "$message" >> "$LOG_FILE"
+}
+
+# Funcție pentru logging cereri în fișier separat
+log_request() {
+    local timestamp="$1"
+    local proxy_ip="$2"
+    local port="$3"
+    echo "[$timestamp] Proxy: $proxy_ip, Port: $port" >> "$REQUEST_LOG_FILE"
+}
+
+# Funcție pentru logging cu afișare și salvare
+log_and_display() {
+    local message="$1"
+    echo -e "$message"
+    local clean_message=$(echo -e "$message" | sed 's/\x1b\[[0-9;]*m//g')
+    log_to_file "$clean_message"
+}
+
+# Funcție pentru a alege proxy random
+get_random_proxy() {
+    if [ "$USE_PROXY" = false ]; then
+        echo ""
+        return
+    fi
+    
+    local proxy_info="${PROXY_LIST[$RANDOM % ${#PROXY_LIST[@]}]}"
+    echo "$proxy_info"
+}
+
+# Funcție pentru actualizarea statisticilor thread-safe
+update_stats() {
+    local stat_type=$1
+    (
+        flock -x 200
+        read total open closed filtered error < "$STATS_FILE"
+        ((total++))
+        case $stat_type in
+            "open") ((open++)) ;;
+            "closed") ((closed++)) ;;
+            "filtered") ((filtered++)) ;;
+            "error") ((error++)) ;;
+        esac
+        echo "$total $open $closed $filtered $error" > "$STATS_FILE"
+    ) 200>"$STATS_FILE.lock"
+}
+
+# Funcție pentru obținerea delay-ului random (stealth)
+get_stealth_delay() {
+    if [ "$STEALTH_MODE" = true ]; then
+        # Adaugă 0-3 secunde random la delay-ul de bază
+        echo $((DELAY + RANDOM % 4))
+    else
+        echo "$DELAY"
+    fi
+}
+
+# Funcție pentru banner grabbing PRIN PROXY
+grab_banner() {
+    local host=$1
+    local port=$2
+    local proxy_info=$3
+    local service_name=""
+    local banner=""
+    
+    # Timeout pentru banner grab
+    local banner_timeout=5
+    
+    if [ "$USE_PROXY" = true ] && [ -n "$proxy_info" ]; then
+        # Configurează proxychains pentru acest banner grab
+        local config_file=$(setup_proxychains "$proxy_info")
+        
+        # Probe specifice pentru diferite servicii - TOATE PRIN PROXY
+        case $port in
+            80|8080|8443)
+                # HTTP probe prin proxy
+                banner=$(echo -e "GET / HTTP/1.0\r\nHost: $host\r\n\r\n" | proxychains -q -f "$config_file" timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -10)
+                service_name="HTTP"
+                ;;
+            443)
+                # HTTPS probe folosind OpenSSL prin proxy
+                if command -v openssl >/dev/null 2>&1; then
+                    banner=$(echo | proxychains -q -f "$config_file" timeout $banner_timeout openssl s_client -connect $host:$port 2>/dev/null | grep -E "subject=|issuer=")
+                    service_name="HTTPS/SSL"
+                fi
+                ;;
+            22)
+                # SSH probe prin proxy
+                banner=$(proxychains -q -f "$config_file" timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -1)
+                service_name="SSH"
+                ;;
+            21)
+                # FTP probe prin proxy
+                banner=$(proxychains -q -f "$config_file" timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -1)
+                service_name="FTP"
+                ;;
+            25|587)
+                # SMTP probe prin proxy
+                banner=$(echo "QUIT" | proxychains -q -f "$config_file" timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -3)
+                service_name="SMTP"
+                ;;
+            3306)
+                # MySQL probe prin proxy
+                banner=$(proxychains -q -f "$config_file" timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -1 | od -An -tx1)
+                service_name="MySQL"
+                ;;
+            *)
+                # Generic probe prin proxy
+                banner=$(echo "" | proxychains -q -f "$config_file" timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -5)
+                ;;
+        esac
+        
+        # Cleanup config file
+        rm -f "$config_file"
+    else
+        # Doar dacă proxy nu e activat (NOT RECOMMENDED!)
+        case $port in
+            80|8080|8443)
+                banner=$(echo -e "GET / HTTP/1.0\r\nHost: $host\r\n\r\n" | timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -10)
+                service_name="HTTP"
+                ;;
+            443)
+                if command -v openssl >/dev/null 2>&1; then
+                    banner=$(echo | timeout $banner_timeout openssl s_client -connect $host:$port 2>/dev/null | grep -E "subject=|issuer=")
+                    service_name="HTTPS/SSL"
+                fi
+                ;;
+            22)
+                banner=$(timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -1)
+                service_name="SSH"
+                ;;
+            *)
+                banner=$(echo "" | timeout $banner_timeout nc -w 2 $host $port 2>/dev/null | head -5)
+                ;;
+        esac
+    fi
+    
+    # Identifică serviciul din banner dacă nu a fost setat
+    if [ -z "$service_name" ] && [ -n "$banner" ]; then
+        for service in "${!SERVICE_SIGNATURES[@]}"; do
+            if echo "$banner" | grep -qE "${SERVICE_SIGNATURES[$service]}"; then
+                service_name="$service"
+                break
+            fi
+        done
+    fi
+    
+    # Curăță banner-ul pentru afișare
+    if [ -n "$banner" ]; then
+        # Elimină caractere non-printabile și limitează lungimea
+        banner=$(echo "$banner" | tr -d '\000-\011\013-\037' | head -1 | cut -c1-60)
+    fi
+    
+    echo "${service_name:-Unknown}|${banner}"
+}
+
+# Funcție pentru scanarea unui port cu proxy support COMPLET
+scan_port_with_proxy() {
+    local host=$1
+    local port=$2
+    local proxy_info=$3
+    
+    if [ -z "$proxy_info" ] || [ "$USE_PROXY" = false ]; then
+        # Scan direct fără proxy (NOT RECOMMENDED!)
+        timeout $TIMEOUT nc -zv -w 2 $host $port >/dev/null 2>&1
+        return $?
+    else
+        # Toate scan-urile trec prin proxy folosind proxychains
+        local config_file=$(setup_proxychains "$proxy_info")
+        
+        # Folosește proxychains pentru TOATE conexiunile
+        proxychains -q -f "$config_file" timeout $TIMEOUT nc -zv -w 2 $host $port >/dev/null 2>&1
+        local result=$?
+        
+        # Cleanup config file
+        rm -f "$config_file"
+        
+        return $result
+    fi
+}
+
+# Funcția principală pentru scanarea unui port
+scan_port() {
+    local port=$1
+    local host=$2
+    
+    local retry_count=0
+    local scan_success=false
+    local port_status="unknown"
+    local last_proxy_ip="direct"
+    
+    # Retry loop pentru scan-uri eșuate
+    while [ $retry_count -lt $MAX_RETRIES ] && [ "$scan_success" = false ]; do
+        # Selectează proxy random
+        local proxy_info=$(get_random_proxy)
+        local proxy_ip=""
+        
+        if [ -n "$proxy_info" ]; then
+            proxy_ip=$(echo "$proxy_info" | cut -d':' -f2)
+        else
+            proxy_ip="direct"
+        fi
+        
+        # Obține timestamp
+        local timestamp=$(date '+%d/%m/%Y - %H:%M:%S')
+        local milliseconds=$(date +%3N)
+        local full_timestamp="${timestamp}:${milliseconds}"
+        
+        # Loghează cererea în fișierul separat
+        log_request "$full_timestamp" "$proxy_ip" "$port"
+        
+        # Încearcă să scaneze portul
+        local start_time=$(date +%s.%N)
+        
+        if scan_port_with_proxy "$host" "$port" "$proxy_info"; then
+            port_status="open"
+            scan_success=true
+        else
+            # Verifică dacă e closed sau filtered
+            if [ $? -eq 1 ]; then
+                port_status="closed"
+                scan_success=true
+            else
+                # Timeout sau eroare - retry cu alt proxy
+                ((retry_count++))
+                if [ $retry_count -lt $MAX_RETRIES ]; then
+                    if [ "$SHOW_RETRY_MESSAGES" = true ]; then
+                        echo -e "${YELLOW}⚠️  Retry $retry_count/$MAX_RETRIES for port $port (failed proxy: $proxy_ip)${NC}" >&2
+                    fi
+                    sleep 0.5
+                fi
+                last_proxy_ip="$proxy_ip"
+                continue
+            fi
+        fi
+        
+        local end_time=$(date +%s.%N)
+        local scan_time=$(echo "$end_time - $start_time" | bc)
+        
+        # Update stats
+        update_stats "total"
+        
+        case $port_status in
+            "open")
+                update_stats "open"
+                
+                # Banner grabbing pentru porturi deschise - PRIN PROXY
+                local service_info=""
+                if [ "$BANNER_GRAB" = true ]; then
+                    local banner_data=$(grab_banner "$host" "$port" "$proxy_info")
+                    local service_name=$(echo "$banner_data" | cut -d'|' -f1)
+                    local banner=$(echo "$banner_data" | cut -d'|' -f2)
+                    
+                    if [ -n "$service_name" ]; then
+                        service_info=" [${service_name}]"
+                    fi
+                    if [ -n "$banner" ]; then
+                        service_info="${service_info} ${PURPLE}[Banner: ${banner}]${NC}"
+                    fi
+                fi
+                
+                log_and_display "${GREEN}[$full_timestamp] ${host}:${CYAN}${port}${NC} (Status: OPEN)${service_info} ${BLUE}[Proxy: ${NC}${proxy_ip}${BLUE}]${NC} [Time: ${scan_time}s]${NC}"
+                ;;
+            "closed")
+                update_stats "closed"
+                # Nu afișăm porturile închise pentru a reduce zgomotul
+                ;;
+            "filtered")
+                update_stats "filtered"
+                log_and_display "${YELLOW}[$full_timestamp] ${host}:${CYAN}${port}${NC} (Status: FILTERED) ${BLUE}[Proxy: ${NC}${proxy_ip}${BLUE}]${NC} [Time: ${scan_time}s]${NC}"
+                ;;
+        esac
+    done
+    
+    # Dacă toate încercările au eșuat
+    if [ "$scan_success" = false ]; then
+        update_stats "total"
+        update_stats "error"
+        if [ "$USE_PROXY" = false ]; then
+            local timestamp=$(date '+%d/%m/%Y - %H:%M:%S')
+            local milliseconds=$(date +%3N)
+            local full_timestamp="${timestamp}:${milliseconds}"
+            log_and_display "${RED}[$full_timestamp] ${host}:${CYAN}${port}${NC} (Status: ERROR/TIMEOUT) ${BLUE}[Proxy: ${NC}direct${BLUE}]${NC}${NC}"
+            # Loghează și eroarea în fișierul de request-uri
+            log_request "$full_timestamp" "direct" "$port"
+        fi
+    fi
+    
+    # Stealth delay între porturi
+    if [ "$STEALTH_MODE" = true ]; then
+        sleep $(get_stealth_delay)
+    fi
+}
+
+# Funcție pentru a genera lista de porturi
+generate_port_list() {
+    local range="$1"
+    local ports=()
+    
+    if [ "$range" = "COMMON" ]; then
+        ports=("${COMMON_PORTS[@]}")
+    elif [[ "$range" =~ ^[0-9]+-[0-9]+$ ]]; then
+        # Range format: 1-1000
+        local start_port=$(echo "$range" | cut -d'-' -f1)
+        local end_port=$(echo "$range" | cut -d'-' -f2)
+        for ((port=start_port; port<=end_port; port++)); do
+            ports+=($port)
+        done
+    elif [[ "$range" =~ ^[0-9,]+$ ]]; then
+        # List format: 80,443,8080
+        IFS=',' read -ra ports <<< "$range"
+    else
+        echo -e "${RED}❌ Invalid port range format${NC}"
+        exit 1
+    fi
+    
+    echo "${ports[@]}"
+}
+
+# Funcția principală de port scanning
+scan_ports() {
+    local host=$1
+    local port_range=$2
+    
+    # Generează lista de porturi
+    local ports=($(generate_port_list "$port_range"))
+    local total_ports=${#ports[@]}
+    local current=0
+    
+    echo -e "${CYAN}🚀 Starting port scan on $total_ports ports...${NC}"
+    if [ "$USE_PROXY" = true ]; then
+        echo -e "${GREEN}🔒 All traffic is being routed through proxies${NC}"
+    else
+        echo -e "${RED}⚠️  WARNING: Scanning without proxy - YOUR IP IS EXPOSED!${NC}"
+    fi
+    log_to_file "🚀 Starting port scan on $total_ports ports..."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Randomizează ordinea porturilor pentru stealth
+    if [ "$STEALTH_MODE" = true ]; then
+        ports=($(printf '%s\n' "${ports[@]}" | shuf))
+    fi
+    
+    # Control numărul de job-uri paralele
+    for port in "${ports[@]}"; do
+        # Așteaptă dacă avem prea multe job-uri active
+        while [ $(jobs -r | wc -l) -ge $MAX_THREADS ]; do
+            sleep 0.1
+        done
+        
+        # Lansează scan-ul în background
+        scan_port "$port" "$host" &
+        
+        ((current++))
+        
+        # Progress indicator
+        if [ $((current % 50)) -eq 0 ]; then
+            local percentage=$((current * 100 / total_ports))
+            echo -e "${BLUE}📊 Progress: $current/$total_ports ports scanned (${percentage}%)${NC}"
+        fi
+        
+        # Delay între lansări
+        sleep $(get_stealth_delay)
+    done
+    
+    # Așteaptă să se termine toate job-urile
+    echo -e "${YELLOW}⏳ Waiting for remaining scans to finish...${NC}"
+    wait
+}
+
+# Afișează statisticile finale
+show_results() {
+    END_TIME=$(date '+%d/%m/%Y - %H:%M:%S')
+    
+    # Citește statisticile finale din fișier
+    if [ -f "$STATS_FILE" ]; then
+        read TOTAL_PORTS_SCANNED OPEN_PORTS CLOSED_PORTS FILTERED_PORTS ERROR_PORTS < "$STATS_FILE"
+    fi
+    
+    local summary_header=""
+    local summary_content=""
+    
+    summary_header="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    summary_content="📊 PORT SCAN SUMMARY"
+    
+    echo ""
+    echo "$summary_header"
+    echo -e "${PURPLE}$summary_content${NC}"
+    echo "$summary_header"
+    echo -e "${CYAN}🚀 Started:  ${START_TIME}${NC}"
+    echo -e "${CYAN}🏁 Finished: ${END_TIME}${NC}"
+    echo -e "${CYAN}🎯 Target:   ${TARGET_HOST}${NC}"
+    echo -e "${CYAN}🔒 Proxy:    $([ "$USE_PROXY" = true ] && echo "ENABLED (Protected)" || echo "DISABLED (IP EXPOSED!)")${NC}"
+    echo ""
+    echo -e "${BLUE}📈 RESULTS SUMMARY:${NC}"
+    echo -e "   ${GREEN}✅ Open Ports:     $OPEN_PORTS${NC}"
+    echo -e "   ${RED}❌ Closed Ports:   $CLOSED_PORTS${NC}"
+    echo -e "   ${YELLOW}🔥 Filtered Ports: $FILTERED_PORTS${NC}"
+    echo -e "   ${ORANGE}⚠️  Error/Timeout:  $ERROR_PORTS${NC}"
+    echo ""
+    echo -e "${PURPLE}📊 Total Ports Scanned: ${TOTAL_PORTS_SCANNED}${NC}"
+    
+    # Calculează timpul total
+    if [ -n "$START_TIME" ] && [ -n "$END_TIME" ]; then
+        local start_seconds=$(date -d "$START_TIME" +%s 2>/dev/null || date +%s)
+        local end_seconds=$(date -d "$END_TIME" +%s 2>/dev/null || date +%s)
+        
+        if [ "$end_seconds" -gt "$start_seconds" ]; then
+            local duration=$((end_seconds - start_seconds))
+            local hours=$((duration / 3600))
+            local minutes=$(((duration % 3600) / 60))
+            local seconds=$((duration % 60))
+            echo -e "${PURPLE}⏱️  Total Time: ${hours}h ${minutes}m ${seconds}s${NC}"
+            
+            # Calculează viteza de scanare
+            if [ "$TOTAL_PORTS_SCANNED" -gt 0 ] && [ "$duration" -gt 0 ]; then
+                local scan_rate=$((TOTAL_PORTS_SCANNED / duration))
+                echo -e "${PURPLE}🚄 Scan Rate: ${scan_rate} ports/second${NC}"
+            fi
+        fi
+    fi
+    
+    echo "$summary_header"
+    echo -e "${GREEN}💾 Results saved to: ${LOG_FILE}${NC}"
+    echo -e "${GREEN}💾 Request log saved to: ${REQUEST_LOG_FILE}${NC}"
+    echo "$summary_header"
+    
+    # Lista porturilor deschise
+    if [ "$OPEN_PORTS" -gt 0 ]; then
+        echo ""
+        echo -e "${GREEN}🔓 OPEN PORTS SUMMARY:${NC}"
+        grep "Status: OPEN" "$LOG_FILE" | while read line; do
+            echo -e "   ${GREEN}$line${NC}"
+        done
+    fi
+    
+    # Security reminder
+    if [ "$USE_PROXY" = false ]; then
+        echo ""
+        echo -e "${RED}⚠️  SECURITY WARNING: This scan was performed without proxy protection!${NC}"
+        echo -e "${RED}   Your real IP address was exposed to the target.${NC}"
+        echo -e "${YELLOW}   Always use --proxy flag for anonymous scanning.${NC}"
+    fi
+    
+    # Salvează summary-ul în fișier
+    {
+        echo ""
+        echo "$summary_header"
+        echo "$summary_content"
+        echo "$summary_header" 
+        echo "🚀 Started:  ${START_TIME}"
+        echo "🏁 Finished: ${END_TIME}"
+        echo "🎯 Target:   ${TARGET_HOST}"
+        echo "🔒 Proxy:    $([ "$USE_PROXY" = true ] && echo "ENABLED (Protected)" || echo "DISABLED (IP EXPOSED!)")"
+        echo ""
+        echo "📈 RESULTS SUMMARY:"
+        echo "   ✅ Open Ports:     $OPEN_PORTS"
+        echo "   ❌ Closed Ports:   $CLOSED_PORTS"
+        echo "   🔥 Filtered Ports: $FILTERED_PORTS"
+        echo "   ⚠️  Error/Timeout:  $ERROR_PORTS"
+        echo ""
+        echo "📊 Total Ports Scanned: ${TOTAL_PORTS_SCANNED}"
+        echo "💾 Request log saved to: ${REQUEST_LOG_FILE}"
+    } >> "$LOG_FILE"
+}
+
+# Trap pentru cleanup la întrerupere
+cleanup() {
+    echo -e "\n${RED}🛑 Interrupted! Cleaning up...${NC}"
+    # Kill all background jobs
+    jobs -p | xargs -r kill 2>/dev/null
+    wait 2>/dev/null
+    show_results
+    # Cleanup stats file and temp proxy configs
+    rm -f "$STATS_FILE" "$STATS_FILE.lock" /tmp/.proxychains_$_*.conf 2>/dev/null
+    exit 1
+}
+
+# Funcție pentru verificarea leak-urilor IP
+check_ip_leak() {
+    if [ "$USE_PROXY" = false ]; then
+        echo -e "${RED}⚠️  IP LEAK CHECK: You are NOT using proxy protection!${NC}"
+        echo -e "${YELLOW}   Your real IP will be exposed during scanning.${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}🔍 Checking for IP leaks...${NC}"
+    
+    # Test cu un proxy random
+    local proxy_info="${PROXY_LIST[$RANDOM % ${#PROXY_LIST[@]}]}"
+    local config_file=$(setup_proxychains "$proxy_info")
+    
+    # Verifică IP-ul prin proxy
+    local proxy_ip=$(proxychains -q -f "$config_file" curl -s https://api.ipify.org 2>/dev/null)
+    local real_ip=$(curl -s https://api.ipify.org 2>/dev/null)
+    
+    rm -f "$config_file"
+    
+    if [ "$proxy_ip" = "$real_ip" ]; then
+        echo -e "${RED}❌ IP LEAK DETECTED! Proxy is not working properly.${NC}"
+        echo -e "${RED}   Real IP: $real_ip${NC}"
+        echo -e "${RED}   Proxy IP: $proxy_ip${NC}"
+        return 1
+    else
+        echo -e "${GREEN}✅ IP leak check passed!${NC}"
+        echo -e "${GREEN}   Your IP: $real_ip (hidden)${NC}"
+        echo -e "${GREEN}   Proxy IP: $proxy_ip (visible to target)${NC}"
+        return 0
+    fi
+}
+
+# Main execution
+main() {
+    # Set trap for interruption
+    trap cleanup INT TERM
+    
+    # Check dependencies first
+    check_dependencies
+    
+    # Show banner and check arguments
+    show_banner
+    check_args "$@"
+    
+    # IP leak check
+    if [ "$USE_PROXY" = true ]; then
+        check_ip_leak || {
+            echo -e "${RED}Aborting due to IP leak risk.${NC}"
+            exit 1
+        }
+    fi
+    
+    # Set start time
+    START_TIME=$(date '+%d/%m/%Y - %H:%M:%S')
+
+    # Start scanning
+    scan_ports "$TARGET_HOST" "$PORT_RANGE"
+    
+    # Show results
+    show_results
+    
+    # Cleanup stats files and temp proxy configs
+    rm -f "$STATS_FILE" "$STATS_FILE.lock" /tmp/.proxychains_$_*.conf 2>/dev/null
+}
+
+# Run main function only if script is executed directly
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi
